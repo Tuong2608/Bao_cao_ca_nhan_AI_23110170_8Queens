@@ -49,7 +49,7 @@ Người dùng có thể chọn thuật toán khác nhau để giải và quan s
 ---
 
 ## 4. Giao diện chương trình
-Hình 4.1: Giao diện bàn cờ và lựa chọn thuật toán.
+![Giao diện bàn cờ và lựa chọn thuật toán](https://raw.githubusercontent.com/Tuong2608/Bao_cao_ca_nhan_AI_23110170_8Queens/refs/heads/main/assets/images/HinhAnhGiaoDien.jpg)
 
 ---
 
