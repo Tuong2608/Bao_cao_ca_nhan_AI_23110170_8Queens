@@ -1,0 +1,825 @@
+import tkinter as tk
+from tkinter import messagebox, scrolledtext, ttk
+import heapq, random, math
+from collections import deque
+
+N = 8
+CELL_SIZE = 60
+
+
+# -----------------------------
+# Kiểm tra an toàn khi đặt hậu (partial state)
+def is_safe_partial(cols, row, col):
+    for r in range(len(cols)):
+        c = cols[r]
+        if c == col or abs(c - col) == abs(r - row):
+            return False
+    return True
+
+
+def run_sensorless():
+    prog = sensorless_belief_progression(max_iters=20)  # tăng nếu cần
+    if not prog:
+        messagebox.showwarning("Sensorless", "Không tạo được progression.")
+        return
+    # hiện bảng trạng thái như trong hình
+    show_belief_table(prog)
+    # đồng thời vẽ belief cuối cùng lên board
+    final_belief = prog[-1]
+    if final_belief:
+        draw_belief(canvas, final_belief)
+
+
+class BeliefState:
+    def __init__(self, states):
+        # đảm bảo mỗi state là tuple để có thể hash vào frozenset
+        self.states = frozenset(tuple(s) for s in states)
+
+    def __eq__(self, other):
+        return self.states == other.states
+
+    def __hash__(self):
+        return hash(self.states)
+
+    def is_goal(self):
+        # goal nếu mọi state trong belief đều là cấu hình hợp lệ (solution)
+        return all(is_solution(s) for s in self.states)
+
+
+def is_solution(state):
+    # kiểm tra cấu hình queen có hợp lệ không
+    for r in range(len(state)):
+        for r2 in range(r + 1, len(state)):
+            if state[r] == state[r2] or abs(state[r] - state[r2]) == abs(r - r2):
+                return False
+    return True
+
+
+def h_conflicting_pairs(state):
+    pairs = 0
+    for i in range(len(state)):
+        for j in range(i + 1, len(state)):
+            if state[i] == state[j] or abs(state[i] - state[j]) == abs(i - j):
+                pairs += 1
+    return pairs
+
+
+def neighbors(state):
+    row = len(state)
+    if row >= N:
+        return []
+    for col in range(N):
+        if is_safe_partial(state, row, col):
+            yield state + [col]
+
+
+def reconstruct_path(parent, end_t):
+    path = []
+    cur = end_t
+    while cur is not None:
+        path.append(list(cur))
+        cur = parent.get(cur)
+    path.reverse()
+    return path
+
+
+def bfs_search(start, goal_list):
+    st = tuple(start)
+    queue = deque([st])
+    parent = {st: None}
+    best = st
+    while queue:
+        state = queue.popleft()
+        if len(state) > len(best):
+            best = state
+        if len(state) == N and (not goal_list or list(state) == goal_list):
+            return reconstruct_path(parent, state), True
+        for nb in neighbors(list(state)):
+            nb_t = tuple(nb)
+            if nb_t not in parent:
+                parent[nb_t] = state
+                queue.append(nb_t)
+    return reconstruct_path(parent, best), False
+
+
+def dfs_search(start, goal_list):
+    st = tuple(start)
+    stack = [st]
+    parent = {st: None}
+    visited = set()
+    best = st
+    while stack:
+        state = stack.pop()
+        if state in visited:
+            continue
+        visited.add(state)
+        if len(state) > len(best):
+            best = state
+        if len(state) == N and (not goal_list or list(state) == goal_list):
+            return reconstruct_path(parent, state), True
+        for nb in reversed(list(neighbors(list(state)))):
+            nb_t = tuple(nb)
+            if nb_t not in parent:
+                parent[nb_t] = state
+            stack.append(nb_t)
+    return reconstruct_path(parent, best), False
+
+
+def ucs_search(start, goal_list):
+    st = tuple(start)
+    frontier = [(0, st)]
+    parent = {st: None}
+    cost_so_far = {st: 0}
+    best = st
+    while frontier:
+        cost, state = heapq.heappop(frontier)
+        if cost != cost_so_far.get(state, float('inf')):  # Fix: Use float('inf') instead of 1<<60 for safety
+            continue
+        if len(state) > len(best):
+            best = state
+        if len(state) == N and (not goal_list or list(state) == goal_list):
+            return reconstruct_path(parent, state), True
+        for nb in neighbors(list(state)):
+            nb_t = tuple(nb)
+            new_cost = cost + 1
+            if new_cost < cost_so_far.get(nb_t, float('inf')):
+                cost_so_far[nb_t] = new_cost
+                parent[nb_t] = state
+                heapq.heappush(frontier, (new_cost, nb_t))
+    return reconstruct_path(parent, best), False
+
+
+def dls_search(start, goal_list, limit):
+    start_t = tuple(start)
+    best_state = start_t
+
+    def recurse(state_t, depth):
+        nonlocal best_state
+        if len(state_t) > len(best_state):
+            best_state = state_t
+        if len(state_t) == N:
+            if not goal_list or list(state_t) == goal_list:
+                return [list(state_t)]
+            else:
+                return None
+        if depth == limit:
+            return None
+        for nb in neighbors(list(state_t)):
+            nb_t = tuple(nb)
+            res = recurse(nb_t, depth + 1)
+            if res is not None:
+                return [list(state_t)] + res
+        return None
+
+    path = recurse(start_t, 0)
+    if path:
+        return path, True
+    return reconstruct_path({best_state: None}, best_state), False
+
+
+def ids_search(start, goal_list, max_additional_depth=None):
+    if max_additional_depth is None:
+        max_additional_depth = N - len(start)
+    for lim in range(0, max_additional_depth + 1):
+        path, found = dls_search(start, goal_list, lim)
+        if found:
+            return path, True
+    return path, False  # Return the last path if not found
+
+
+def greedy_search(start, goal_list):
+    st = tuple(start)
+    frontier = [(h_conflicting_pairs(list(st)), st)]
+    parent = {st: None}
+    visited = set()
+    best = st
+    while frontier:
+        hval, state = heapq.heappop(frontier)
+        if state in visited:
+            continue
+        visited.add(state)
+        if len(state) > len(best):
+            best = state
+        if len(state) == N and (not goal_list or list(state) == goal_list):
+            return reconstruct_path(parent, state), True
+        for nb in neighbors(list(state)):
+            nb_t = tuple(nb)
+            if nb_t not in parent:
+                parent[nb_t] = state
+            heapq.heappush(frontier, (h_conflicting_pairs(nb), nb_t))
+    return reconstruct_path(parent, best), False
+
+
+def astar_search(start, goal_list):
+    st = tuple(start)
+    frontier = [(h_conflicting_pairs(list(st)), 0, st)]
+    parent = {st: None}
+    cost_so_far = {st: 0}
+    best = st
+    while frontier:
+        f, g, state = heapq.heappop(frontier)
+        if g != cost_so_far.get(state, None):
+            continue
+        if len(state) > len(best):
+            best = state
+        if len(state) == N and (not goal_list or list(state) == goal_list):
+            return reconstruct_path(parent, state), True
+        for nb in neighbors(list(state)):
+            nb_t = tuple(nb)
+            new_cost = g + 1
+            if new_cost < cost_so_far.get(nb_t, float('inf')):
+                cost_so_far[nb_t] = new_cost
+                parent[nb_t] = state
+                fval = new_cost + h_conflicting_pairs(nb)
+                heapq.heappush(frontier, (fval, new_cost, nb_t))
+    return reconstruct_path(parent, best), False
+
+
+def hill_climbing(start, goal_list, max_iter=1000):
+    def random_state():
+        return [random.randint(0, N - 1) for _ in range(N)]
+
+    current = start if len(start) == N else random_state()
+    path = [current[:]]
+    for _ in range(max_iter):
+        h = h_conflicting_pairs(current)
+        if h == 0: return path, True
+        neighbors_list = []
+        for row in range(N):
+            for col in range(N):
+                if col != current[row]:
+                    new_state = current[:]
+                    new_state[row] = col
+                    neighbors_list.append(new_state)
+        next_state = min(neighbors_list, key=h_conflicting_pairs)
+        if h_conflicting_pairs(next_state) >= h:
+            return path, False
+        current = next_state
+        path.append(current[:])
+    return path, False
+
+
+def simulated_annealing(start, goal_list, max_iter=10000, temp=100.0, cooling=0.995):
+    def random_state():
+        return [random.randint(0, N - 1) for _ in range(N)]
+
+    current = start if len(start) == N else random_state()
+    path = [current[:]]
+    for _ in range(max_iter):
+        h = h_conflicting_pairs(current)
+        if h == 0: return path, True
+        row = random.randint(0, N - 1)
+        col = random.randint(0, N - 1)
+        neighbor = current[:]
+        neighbor[row] = col
+        delta = h_conflicting_pairs(neighbor) - h
+        if delta < 0 or random.random() < math.exp(-delta / temp):
+            current = neighbor
+            path.append(current[:])
+        temp *= cooling
+        if temp <= 0.001: break
+    return path, h_conflicting_pairs(current) == 0
+
+
+def beam_search(start, goal_list, beam_width=3):
+    frontier = [(0, start)]
+    parent = {tuple(start): None}
+    best = start
+    while frontier:
+        new_frontier = []
+        for _, state in frontier:
+            if len(state) == N and h_conflicting_pairs(state) == 0:
+                return reconstruct_path(parent, tuple(state)), True
+            for nb in neighbors(state):
+                nb_t = tuple(nb)
+                if nb_t not in parent:
+                    parent[nb_t] = tuple(state)
+                new_frontier.append((h_conflicting_pairs(nb), nb))
+        new_frontier.sort(key=lambda x: x[0])
+        frontier = new_frontier[:beam_width]
+        if frontier:
+            best = frontier[0][1]
+    return reconstruct_path(parent, tuple(best)), False
+
+
+def genetic_algorithm(start, goal_list, pop_size=50, generations=500, mutation_rate=0.1):
+    def random_state():
+        return [random.randint(0, N - 1) for _ in range(N)]
+
+    def fitness(state):
+        return -h_conflicting_pairs(state)
+
+    def crossover(p1, p2):
+        point = random.randint(1, N - 2)
+        return p1[:point] + p2[point:]
+
+    def mutate(state):
+        if random.random() < mutation_rate:
+            row = random.randint(0, N - 1)
+            state[row] = random.randint(0, N - 1)
+        return state
+
+    population = [random_state() for _ in range(pop_size)]
+    path = []
+    for gen in range(generations):
+        population.sort(key=lambda s: h_conflicting_pairs(s))
+        best = population[0]
+        path.append(best[:])
+        if h_conflicting_pairs(best) == 0:
+            return path, True
+        new_pop = population[:pop_size // 2]
+        while len(new_pop) < pop_size:
+            p1, p2 = random.sample(new_pop, 2)
+            child = mutate(crossover(p1, p2))
+            new_pop.append(child)
+        population = new_pop
+    return path, False
+
+
+def and_or_search(start, goal_list):
+    start_t = tuple(start)
+    best = start_t
+
+    def or_search(state):
+        nonlocal best
+        if len(state) > len(best): best = state
+        if len(state) == N:
+            if not goal_list or list(state) == goal_list:
+                return [list(state)]
+            return None
+        for nb in neighbors(list(state)):
+            res = and_search(nb)
+            if res is not None:
+                return [list(state)] + res
+        return None
+
+    def and_search(state):
+        return or_search(state)
+
+    path = or_search(start_t)
+    if path:
+        return path, True
+    return reconstruct_path({best: None}, best), False
+
+
+def belief_search(start, goal_list, max_iter=2000):
+    belief = {tuple(start)}
+    parent = {tuple(start): None}
+    best = tuple(start)
+    for _ in range(max_iter):
+        new_belief = set()
+        for st in belief:
+            if len(st) > len(best): best = st
+            if len(st) == N and (not goal_list or list(st) == goal_list):
+                return reconstruct_path(parent, st), True
+            for nb in neighbors(list(st)):
+                nb_t = tuple(nb)
+                if nb_t not in parent:
+                    parent[nb_t] = st
+                new_belief.add(nb_t)
+        if not new_belief:
+            break
+        belief = new_belief
+    return reconstruct_path(parent, best), False
+
+
+def sensorless_belief_search():
+    # Sinh tất cả cấu hình hợp lệ đầy đủ (độ dài N) bằng cách xây dần row-by-row
+    all_states = [[]]
+    for row in range(N):
+        new_states = []
+        for state in all_states:
+            for col in range(N):
+                if is_safe_partial(state, row, col):
+                    new_states.append(state + [col])
+        all_states = new_states
+
+    if not all_states:
+        return None
+    # all_states là list of lists -> BeliefState sẽ convert mỗi state thành tuple
+    return BeliefState(all_states)
+
+
+# ----------------- Backtracking -----------------
+def backtracking_search(start, goal_list):
+    path = []
+
+    def backtrack(state, row):
+        if row == N:
+            if not goal_list or state == goal_list:
+                path.append(state[:])
+                return True
+            return False
+        for col in range(N):
+            if is_safe_partial(state, row, col):
+                state.append(col)
+                path.append(state[:])
+                if backtrack(state, row + 1):
+                    return True
+                state.pop()
+        return False
+
+    state = start[:]
+    success = backtrack(state, len(state))
+    return path, success
+
+
+# ----------------- Forward Checking -----------------
+def forward_checking_search(start, goal_list):
+    path = []
+
+    def fc(state, row, domains):
+        if row == N:
+            if not goal_list or state == goal_list:
+                path.append(state[:])
+                return True
+            return False
+        for col in domains[row][:]:
+            if is_safe_partial(state, row, col):
+                state.append(col)
+                path.append(state[:])
+                # copy domain cho bước tiếp theo
+                new_domains = [d[:] for d in domains]
+                # loại bỏ col và đường chéo khỏi các row sau
+                for r in range(row + 1, N):
+                    if col in new_domains[r]:
+                        new_domains[r].remove(col)
+                    d1 = col + (r - row)
+                    d2 = col - (r - row)
+                    if d1 in new_domains[r]:
+                        new_domains[r].remove(d1)
+                    if d2 in new_domains[r]:
+                        new_domains[r].remove(d2)
+                if fc(state, row + 1, new_domains):
+                    return True
+                state.pop()
+        return False
+
+    state = start[:]
+    # ban đầu domain mỗi row là tất cả cột
+    domains = [list(range(N)) for _ in range(N)]
+    # lọc theo trạng thái đã có
+    for r, c in enumerate(state):
+        domains[r] = [c]
+
+    success = fc(state, len(state), domains)
+    return path, success
+
+
+# ----------------- AC-3 (ACBA) -----------------
+def ac3_search(start, goal_list):
+    path = []
+
+    def ac3(domains):
+        queue = deque()
+        # Khởi tạo queue với tất cả các ràng buộc
+        for i in range(N):
+            for j in range(i + 1, N):
+                queue.append((i, j))
+                queue.append((j, i))
+
+        while queue:
+            i, j = queue.popleft()
+            if revise(domains, i, j):
+                if not domains[i]:
+                    return False
+                for k in range(N):
+                    if k != i and k != j:
+                        queue.append((k, i))
+        return True
+
+    def revise(domains, i, j):
+        revised = False
+        for x in domains[i][:]:
+            # Kiểm tra xem có giá trị y nào trong domains[j] thỏa mãn ràng buộc không
+            consistent = False
+            for y in domains[j]:
+                if y != x and abs(y - x) != abs(j - i):
+                    consistent = True
+                    break
+            if not consistent:
+                domains[i].remove(x)
+                revised = True
+        return revised
+
+    def backtrack_with_ac3(state, row, domains):
+        if row == N:
+            if not goal_list or state == goal_list:
+                path.append(state[:])
+                return True
+            return False
+
+        # Tạo bản sao của domains để không ảnh hưởng đến các nhánh khác
+        current_domains = [d[:] for d in domains]
+
+        # Áp dụng AC-3
+        if not ac3(current_domains):
+            return False
+
+        for col in current_domains[row]:
+            if is_safe_partial(state, row, col):
+                state.append(col)
+                path.append(state[:])
+
+                # Cập nhật domains cho các biến chưa gán
+                new_domains = [d[:] for d in current_domains]
+                new_domains[row] = [col]
+
+                # Loại bỏ giá trị không phù hợp khỏi các domains tương lai
+                for r in range(row + 1, N):
+                    if col in new_domains[r]:
+                        new_domains[r].remove(col)
+                    d1 = col + (r - row)
+                    d2 = col - (r - row)
+                    if d1 in new_domains[r]:
+                        new_domains[r].remove(d1)
+                    if d2 in new_domains[r]:
+                        new_domains[r].remove(d2)
+
+                if backtrack_with_ac3(state, row + 1, new_domains):
+                    return True
+                state.pop()
+        return False
+
+    state = start[:]
+    # Khởi tạo domains
+    domains = [list(range(N)) for _ in range(N)]
+
+    # Cập nhật domains theo trạng thái ban đầu
+    for r, c in enumerate(state):
+        domains[r] = [c]
+
+    success = backtrack_with_ac3(state, len(state), domains)
+    return path, success
+
+
+def parse_goal_input(s):
+    s = s.strip()
+    if not s: return []
+    parts = s.split()
+    if len(parts) == N:
+        vals = [int(x) for x in parts]
+        if all(1 <= v <= N for v in vals): return [v - 1 for v in vals]
+        if all(0 <= v < N for v in vals): return vals  # Allow 0-based
+        raise ValueError("Goal phải gồm 8 số từ 0 đến 7 hoặc 1 đến 8")
+    raise ValueError("Goal phải gồm đúng 8 số")
+
+
+# VẼ belief (nhiều khả năng cùng lúc)
+def draw_belief(canvas, belief_states):
+    """
+    belief_states: iterable of tuples (each tuple = state, e.g. (c0,c1,...))
+    Vẽ tất cả trạng thái khả dĩ; ô xuất hiện trong mọi state -> đỏ, xuất hiện trong vài state -> xám nhỏ.
+    """
+    canvas.delete("all")
+    # vẽ bàn cờ
+    for i in range(N):
+        for j in range(N):
+            x0, y0 = j * CELL_SIZE, i * CELL_SIZE
+            x1, y1 = x0 + CELL_SIZE, y0 + CELL_SIZE
+            color = "#EEEED2" if (i + j) % 2 == 0 else "#769656"
+            canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="black")
+
+    # đếm số lần một ô được hậu chiếm trong toàn belief
+    pos_count = {}
+    total = 0
+    for st in belief_states:
+        total += 1
+        for r, c in enumerate(st):
+            pos_count[(r, c)] = pos_count.get((r, c), 0) + 1
+
+    if total == 0:
+        return
+
+    for (r, c), cnt in pos_count.items():
+        x = c * CELL_SIZE + CELL_SIZE // 2
+        y = r * CELL_SIZE + CELL_SIZE // 2
+        if cnt == total:
+            canvas.create_text(x, y, text="♛", font=("Arial", 32, "bold"), fill="red")
+        else:
+            # mơ hồ -> nhỏ và xám
+            canvas.create_text(x, y, text="♛", font=("Arial", 18, "bold"), fill="gray")
+
+
+# Sinh progression của belief states: bắt đầu từ belief = {empty partial state}
+def sensorless_belief_progression(max_iters=20):
+    """
+    Trả về một list các belief (mỗi belief là set of tuples).
+    Mỗi bước: belief_{t+1} = union over neighbors(s) for s in belief_t
+    Dừng khi belief không thay đổi hoặc tất cả là full solutions hoặc đạt max_iters.
+    """
+    belief = {tuple()}  # bắt đầu với trạng thái rỗng (partial)
+    progression = [belief]
+
+    for it in range(1, max_iters + 1):
+        new_belief = set()
+        for st in belief:
+            # nếu đã đủ N (full), giữ lại (các state full sẽ vẫn tồn tại)
+            if len(st) == N:
+                new_belief.add(st)
+                continue
+            # mở rộng từng state
+            for nb in neighbors(list(st)):
+                new_belief.add(tuple(nb))
+        progression.append(new_belief)
+        # dừng khi không thay đổi
+        if new_belief == belief:
+            break
+        belief = new_belief
+        # nếu tất cả đều full-matched solutions thì dừng
+        all_full = all(len(s) == N and is_solution(list(s)) for s in belief) if belief else False
+        if all_full:
+            break
+    return progression
+
+
+# Hiển thị một cửa sổ dạng bảng (Treeview) giống hình bạn gửi
+def show_belief_table(progression):
+    """
+    progression: list of beliefs
+    mỗi row sẽ chứa: State i, Queens position (text of candidate states), Check goal
+    """
+    win = tk.Toplevel(root)
+    win.title("Sensorless — Belief progression")
+
+    cols = ("State", "Queens position", "Cost", "Heuris", "Limit", "Temp", "Accep", "Beam", "Check goal")
+    tree = ttk.Treeview(win, columns=cols, show='headings', height=20)
+    for c in cols:
+        tree.heading(c, text=c)
+        # cột Queens position dài hơn
+        if c == "Queens position":
+            tree.column(c, width=700, anchor='w')
+        else:
+            tree.column(c, width=80, anchor='w')
+    tree.pack(fill='both', expand=True, padx=6, pady=6)
+
+    # populate
+    for i, belief in enumerate(progression):
+        label = f"State {i}"
+        # format danh sách các state thành chuỗi giống ảnh: mỗi state là list of (row,col)
+        states_strs = []
+        for st in sorted(belief):
+            pairs = [(r, st[r]) for r in range(len(st))]
+            states_strs.append(str(pairs))
+        qpos = "[" + ", ".join(states_strs) + "]"
+        check_goal = "Yes" if belief and all(len(s) == N and is_solution(list(s)) for s in belief) else "No"
+        tree.insert('', 'end', values=(label, qpos, "None", "None", "None", "None", "None", "None", check_goal))
+
+    # nút điều khiển đơn giản (Close)
+    btn_frame = tk.Frame(win)
+    btn_frame.pack(fill='x', padx=6, pady=6)
+    tk.Button(btn_frame, text="Close", command=win.destroy).pack(side='right')
+
+
+def draw_board(canvas, state):
+    canvas.delete("all")
+    if state is None: state = []
+    padded = state + [None] * (N - len(state))
+    for i in range(N):
+        for j in range(N):
+            x0, y0 = j * CELL_SIZE, i * CELL_SIZE
+            x1, y1 = x0 + CELL_SIZE, y0 + CELL_SIZE
+            color = "#EEEED2" if (i + j) % 2 == 0 else "#769656"
+            canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="black")
+    for r, c in enumerate(padded):
+        if c is not None:
+            x = c * CELL_SIZE + CELL_SIZE // 2
+            y = r * CELL_SIZE + CELL_SIZE // 2
+            canvas.create_text(x, y, text="♛", font=("Arial", 32, "bold"), fill="red")
+
+
+def animate_solution(canvas, path, delay=400):
+    for i, st in enumerate(path):
+        padded = st + [None] * (N - len(st))
+        canvas.after(i * delay, lambda s=padded: draw_board(canvas, s))
+    if path:
+        final = path[-1] + [None] * (N - len(path[-1]))
+        canvas.after(len(path) * delay, lambda s=final: draw_board(canvas, s))
+
+
+def show_path_window(path, alg_name, found):
+    w = tk.Toplevel(root)
+    w.title(f"Kết quả — {alg_name}")
+    txt = scrolledtext.ScrolledText(w, width=50, height=20, wrap='none', font=("Consolas", 11))
+    txt.pack(fill='both', expand=True)
+    txt.insert('end', f"Algorithm: {alg_name}\nFound: {found}\nSteps: {len(path)}\n\n")
+    for i, st in enumerate(path):
+        human = [v + 1 for v in st]
+        txt.insert('end', f"Step {i}: {human}\n")
+    txt.configure(state='disabled')
+
+
+start_state = []
+
+
+def on_click(event):
+    global start_state
+    row, col = event.y // CELL_SIZE, event.x // CELL_SIZE
+    if row < N and col < N:
+        if row == len(start_state):
+            start_state.append(col)
+        elif row < len(start_state):
+            start_state[row] = col
+        draw_board(canvas, start_state)
+
+
+def clear_board():
+    global start_state
+    start_state = []
+    draw_board(canvas, [])
+
+
+def is_valid_state(state):
+    n = len(state)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if state[i] == state[j] or abs(state[i] - state[j]) == abs(i - j):
+                return False
+    return True
+
+
+def run_algorithm(alg_name):
+    raw = entry_goal.get().strip()
+    try:
+        goal_list = parse_goal_input(raw)
+    except ValueError as e:
+        messagebox.showerror("Lỗi", str(e))
+        return
+
+    start = start_state.copy()
+
+    if len(start) > 1 and not is_valid_state(start):
+        messagebox.showerror("Lỗi", "Trạng thái ban đầu không hợp lệ (có hậu ăn nhau).")
+        return
+
+    if alg_name == "DFS":
+        path, found = dfs_search(start, goal_list)
+    elif alg_name == "BFS":
+        path, found = bfs_search(start, goal_list)
+    elif alg_name == "UCS":
+        path, found = ucs_search(start, goal_list)
+    elif alg_name == "DLS":
+        path, found = dls_search(start, goal_list, simple_limit_var.get())
+    elif alg_name == "IDS":
+        path, found = ids_search(start, goal_list)
+    elif alg_name == "Greedy":
+        path, found = greedy_search(start, goal_list)
+    elif alg_name == "A*":
+        path, found = astar_search(start, goal_list)
+    elif alg_name == "Hill":
+        path, found = hill_climbing(start, goal_list)
+    elif alg_name == "Anneal":
+        path, found = simulated_annealing(start, goal_list)
+    elif alg_name == "Beam":
+        path, found = beam_search(start, goal_list)
+    elif alg_name == "Genetic":
+        path, found = genetic_algorithm(start, goal_list)
+    elif alg_name == "ANDNOR":
+        path, found = and_or_search(start, goal_list)
+    elif alg_name == "Belief":
+        path, found = belief_search(start, goal_list)
+    elif alg_name == "Backtrack":
+        path, found = backtracking_search(start, goal_list)
+    elif alg_name == "Forward":
+        path, found = forward_checking_search(start, goal_list)
+    elif alg_name == "ACBA":
+        path, found = ac3_search(start, goal_list)
+    else:
+        return
+
+    animate_solution(canvas, path, delay=300)
+    show_path_window(path, alg_name, found)
+
+
+root = tk.Tk()
+root.title("8-Queens — AI Search Algorithms")
+
+top = tk.Frame(root);
+top.pack(pady=6)
+tk.Label(top, text="Goal (8 số, có thể 0..7 hoặc 1..8; để trống):").pack(side='left')
+entry_goal = tk.Entry(top, width=28);
+entry_goal.pack(side='left', padx=6)
+
+dls_frame = tk.Frame(root);
+dls_frame.pack(pady=4)
+tk.Label(dls_frame, text="DLS limit:").pack(side='left')
+simple_limit_var = tk.IntVar(value=4)
+tk.Entry(dls_frame, width=4, textvariable=simple_limit_var).pack(side='left', padx=6)
+
+btn_frame = tk.Frame(root);
+btn_frame.pack(pady=6)
+algs = ["DFS", "BFS", "UCS", "DLS", "IDS", "Greedy", "A*", "Hill", "Anneal", "Beam", "Genetic", "ANDNOR", "Belief",
+        "Backtrack", "Forward", "ACBA"]
+for alg in algs:
+    tk.Button(btn_frame, text=alg, width=8, command=lambda a=alg: run_algorithm(a)).pack(side='left', padx=2, pady=2)
+tk.Button(btn_frame, text="Sensorless", width=10, command=run_sensorless).pack(side='left', padx=2, pady=2)
+
+canvas = tk.Canvas(root, width=N * CELL_SIZE, height=N * CELL_SIZE, bg="white")
+canvas.pack(pady=6)
+canvas.bind("<Button-1>", on_click)
+
+clear_btn = tk.Button(root, text="Clear Board", command=clear_board)
+clear_btn.pack(pady=4)
+
+draw_board(canvas, [])
+root.mainloop()
